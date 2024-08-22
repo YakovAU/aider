@@ -10,8 +10,12 @@ from dotenv import load_dotenv
 from prompt_toolkit.enums import EditingMode
 
 from aider import __version__, models, utils
-from aider.poe_api import poe_api
 from aider.args import get_parser
+
+try:
+    from aider.poe_api import poe_api
+except ImportError:
+    poe_api = None
 from aider.coders import Coder
 from aider.commands import Commands, SwitchCoder
 from aider.history import ChatSummary
@@ -346,10 +350,16 @@ def main(argv=None, input=None, output=None, force_git_root=None, return_coder=F
     args = parser.parse_args(argv)
 
     # Initialize POE API
+    if poe_api is None:
+        print("Error: POE API module not found. Make sure you have installed the required dependencies.")
+        print("You may need to run: pip install poe-api-wrapper")
+        return 1
+
     try:
-        poe_api
-    except NameError:
-        print("Error: POE API initialization failed. Make sure POE_P_B and POE_P_LAT environment variables are set.")
+        poe_api.PoeApiWrapper()
+    except ValueError as e:
+        print(f"Error: POE API initialization failed. {str(e)}")
+        print("Make sure POE_P_B and POE_P_LAT environment variables are set.")
         return 1
 
     if not args.verify_ssl:
