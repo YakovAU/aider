@@ -5,6 +5,7 @@ import backoff
 
 from aider.dump import dump  # noqa: F401
 from aider.llm import litellm
+from aider.poe_api import poe_api
 
 # from diskcache import Cache
 
@@ -51,6 +52,19 @@ def send_completion(
 ):
     from aider.llm import litellm
 
+    if model_name.startswith("poe-"):
+        # Handle POE models
+        context = "\n".join([f"{m['role']}: {m['content']}" for m in messages])
+        full_message = context
+
+        def poe_generator():
+            for chunk in poe_api.send_message(model_name, full_message):
+                yield chunk["text"]
+
+        hash_object = hashlib.sha1(full_message.encode())
+        return hash_object, poe_generator()
+
+    # Handle other models using litellm
     kwargs = dict(
         model=model_name,
         messages=messages,
@@ -74,8 +88,6 @@ def send_completion(
 
     if not stream and CACHE is not None and key in CACHE:
         return hash_object, CACHE[key]
-
-    # del kwargs['stream']
 
     res = litellm.completion(**kwargs)
 

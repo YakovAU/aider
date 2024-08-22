@@ -10,6 +10,7 @@ from dotenv import load_dotenv
 from prompt_toolkit.enums import EditingMode
 
 from aider import __version__, models, utils
+from aider.poe_api import poe_api
 from aider.args import get_parser
 from aider.coders import Coder
 from aider.commands import Commands, SwitchCoder
@@ -343,6 +344,13 @@ def main(argv=None, input=None, output=None, force_git_root=None, return_coder=F
 
     # Parse again to include any arguments that might have been defined in .env
     args = parser.parse_args(argv)
+
+    # Initialize POE API
+    try:
+        poe_api
+    except NameError:
+        print("Error: POE API initialization failed. Make sure POE_P_B and POE_P_LAT environment variables are set.")
+        return 1
 
     if not args.verify_ssl:
         import httpx

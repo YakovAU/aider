@@ -81,7 +81,30 @@ class ModelSettings:
 # https://platform.openai.com/docs/models/gpt-3-5-turbo
 # https://openai.com/pricing
 
+POE_MODELS = [
+    "poe-Assistant", "poe-Web-Search", "poe-Claude-3.5-Sonnet", "poe-FLUX-pro",
+    "poe-GPT-4o-Mini", "poe-GPT-4o", "poe-ChatGPT-4o-Latest", "poe-Llama-3.1-405B",
+    "poe-Llama-3.1-405B-T", "poe-Gemini-1.5-Flash", "poe-Gemini-1.5-Pro",
+    "poe-Llama-3.1-70B", "poe-Llama-3.1-8B", "poe-Playground-v2.5", "poe-Ideogram",
+    "poe-FLUX-dev", "poe-FLUX-schnell", "poe-PlaygroundUpscaler", "poe-Pika",
+    "poe-LivePortrait", "poe-Llama-3.1-405B-FW-128k", "poe-Llama-3.1-8B-T-128k",
+    "poe-Llama-3.1-70B-FW-128k", "poe-Llama-3.1-70B-T-128k", "poe-Llama-3.1-8B-FW-128k",
+    "poe-Llama-3-70b-Groq", "poe-Gemma-2-27b-T", "poe-Claude-3-Sonnet",
+    "poe-Claude-3-Haiku", "poe-Claude-3-Opus", "poe-DALL-E-3", "poe-Gemini-1.5-Flash-128k",
+    "poe-Gemini-1.5-Pro-128k", "poe-Gemini-1.5-Flash-1M", "poe-Gemini-1.5-Pro-2M",
+    "poe-GPT-4o-Mini-128k", "poe-GPT-4o-128k", "poe-ChatGPT-4o-Latest-128k",
+    "poe-GPT-4-Turbo", "poe-Gemini-1.5-Pro-Search", "poe-Gemini-1.0-Pro",
+    "poe-Gemini-1.5-Flash-Search", "poe-StableDiffusion3", "poe-SD3-Turbo",
+    "poe-StableDiffusionXL", "poe-StableDiffusion3-2B", "poe-SD3-Medium",
+    "poe-Llama-3-70B-T", "poe-Llama-3-70b-Inst-FW", "poe-Mixtral8x22b-Inst-FW",
+    "poe-Command-R", "poe-Gemma-2-9b-T", "poe-Mistral-Large-2", "poe-Mistral-Large-2-128k",
+    "poe-Mistral-Medium", "poe-Snowflake-Arctic-T", "poe-RekaCore", "poe-RekaFlash",
+    "poe-Command-R-Plus", "poe-GPT-3.5-Turbo", "poe-GPT-3.5-Turbo-16k",
+    "poe-GPT-4-Turbo-128k", "poe-Claude-3.5-Sonnet-200k"
+]
+
 MODEL_SETTINGS = [
+    *[ModelSettings(name=model, edit_format="whole") for model in POE_MODELS],
     # gpt-3.5
     ModelSettings(
         "gpt-3.5-turbo",
