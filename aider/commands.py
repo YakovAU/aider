@@ -106,7 +106,8 @@ class Commands:
         )
 
     def completions_model(self):
-        models = litellm.model_cost.keys()
+        from aider.models import POE_MODELS
+        models = list(litellm.model_cost.keys()) + POE_MODELS
         return models
 
     def cmd_models(self, args):
