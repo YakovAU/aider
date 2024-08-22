@@ -98,6 +98,30 @@ def get_parser(default_config_files, git_root):
         const=gpt_4_turbo_model,
         help=f"Use {gpt_4_turbo_model} model for the main chat",
     )
+    poe_claude_3_5_sonnet_model = "poe/Claude-3.5-Sonnet"
+    group.add_argument(
+        "--poe-claude-3-5",
+        action="store_const",
+        dest="model",
+        const=poe_claude_3_5_sonnet_model,
+        help=f"Use {poe_claude_3_5_sonnet_model} model for the main chat",
+    )
+    poe_gpt_4o_model = "poe/GPT-4o"
+    group.add_argument(
+        "--poe-4o",
+        action="store_const",
+        dest="model",
+        const=poe_gpt_4o_model,
+        help=f"Use {poe_gpt_4o_model} model for the main chat",
+    )
+    poe_gpt_4o_mini_model = "poe/GPT-4o-Mini"
+    group.add_argument(
+        "--poe-mini",
+        action="store_const",
+        dest="model",
+        const=poe_gpt_4o_mini_model,
+        help=f"Use {poe_gpt_4o_mini_model} model for the main chat",
+    )
     gpt_3_model_name = "gpt-3.5-turbo"
     group.add_argument(
         "--35turbo",
