@@ -106,9 +106,9 @@ class Commands:
         )
 
     def completions_model(self):
-        from aider.models import POE_MODELS
-        models = list(litellm.model_cost.keys()) + POE_MODELS
-        return models
+        from aider.models import POE_MODELS, OPENAI_MODELS, ANTHROPIC_MODELS
+        models = list(litellm.model_cost.keys()) + POE_MODELS + OPENAI_MODELS + ANTHROPIC_MODELS
+        return sorted(set(models))
 
     def cmd_models(self, args):
         "Search the list of available models"
