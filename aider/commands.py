@@ -118,7 +118,10 @@ class Commands:
         if args:
             models.print_matching_models(self.io, args)
         else:
-            self.io.tool_output("Please provide a partial model name to search for.")
+            model_list = self.completions_model()
+            self.io.tool_output("Available models:")
+            for model in model_list:
+                self.io.tool_output(f"- {model}")
 
     def cmd_web(self, args, paginate=True):
         "Scrape a webpage, convert to markdown and add to the chat"
