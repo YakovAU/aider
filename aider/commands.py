@@ -14,6 +14,7 @@ from prompt_toolkit.completion import Completion, PathCompleter
 from prompt_toolkit.document import Document
 
 from aider import models, prompts, voice
+from vectorquery import Pipeline
 from aider.format_settings import format_settings
 from aider.help import Help, install_help_extra
 from aider.llm import litellm
@@ -1279,6 +1280,27 @@ class Commands:
             title = None
 
         report_github_issue(issue_text, title=title, confirm=False)
+
+    def cmd_vector(self, args):
+        "Query the Qdrant database using Voyage AI and add results to chat context"
+        if not args.strip():
+            self.io.tool_error("Please provide a query for the vector database.")
+            return
+
+        pipeline = Pipeline()
+        query = args.strip()
+        collection_name = pipeline.valves.COLLECTION_NAME
+
+        try:
+            context = pipeline.perform_targeted_search(query, collection_name)
+            answer, _ = pipeline.query_model(query, context, collection_name)
+
+            self.io.tool_output("Vector search results:")
+            self.io.tool_output(answer)
+
+            return f"Vector search results for query '{query}':\n\n{answer}"
+        except Exception as e:
+            self.io.tool_error(f"Error querying vector database: {str(e)}")
 
 
 def expand_subdir(file_path):
