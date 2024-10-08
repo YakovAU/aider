@@ -2,6 +2,7 @@ import colorsys
 import math
 import os
 import random
+import sqlite3
 import sys
 import time
 import warnings
@@ -13,10 +14,10 @@ from diskcache import Cache
 from grep_ast import TreeContext, filename_to_lang
 from pygments.lexers import guess_lexer_for_filename
 from pygments.token import Token
-from pygments.util import ClassNotFound
 from tqdm import tqdm
 
 from aider.dump import dump
+from aider.special import filter_important_files
 from aider.utils import Spinner
 
 # tree_sitter is throwing a FutureWarning
@@ -24,6 +25,9 @@ warnings.simplefilter("ignore", category=FutureWarning)
 from tree_sitter_languages import get_language, get_parser  # noqa: E402
 
 Tag = namedtuple("Tag", "rel_fname fname line name kind".split())
+
+
+SQLITE_ERRORS = (sqlite3.OperationalError, sqlite3.DatabaseError)
 
 
 class RepoMap:
@@ -155,17 +159,20 @@ class RepoMap:
         return repo_content
 
     def get_rel_fname(self, fname):
-        return os.path.relpath(fname, self.root)
-
-    def split_path(self, path):
-        path = os.path.relpath(path, self.root)
-        return [path + ":"]
+        try:
+            return os.path.relpath(fname, self.root)
+        except ValueError:
+            # Issue #1288: ValueError: path is on mount 'C:', start on mount 'D:'
+            # Just return the full fname.
+            return fname
 
     def load_tags_cache(self):
         path = Path(self.root) / self.TAGS_CACHE_DIR
-        if not path.exists():
-            self.cache_missing = True
-        self.TAGS_CACHE = Cache(path)
+        try:
+            self.TAGS_CACHE = Cache(path)
+        except SQLITE_ERRORS:
+            self.io.tool_warning(f"Unable to use tags cache, delete {path} to resolve.")
+            self.TAGS_CACHE = dict()
 
     def save_tags_cache(self):
         pass
@@ -174,7 +181,7 @@ class RepoMap:
         try:
             return os.path.getmtime(fname)
         except FileNotFoundError:
-            self.io.tool_error(f"File not found error: {fname}")
+            self.io.tool_warning(f"File not found error: {fname}")
 
     def get_tags(self, fname, rel_fname):
         # Check if the file is in the cache and if the modification time has not changed
@@ -183,15 +190,20 @@ class RepoMap:
             return []
 
         cache_key = fname
-        if cache_key in self.TAGS_CACHE and self.TAGS_CACHE[cache_key]["mtime"] == file_mtime:
+        val = self.TAGS_CACHE.get(cache_key)  # Issue #1308
+        if val is not None and val.get("mtime") == file_mtime:
             return self.TAGS_CACHE[cache_key]["data"]
 
         # miss!
         data = list(self.get_tags_raw(fname, rel_fname))
 
         # Update the cache
-        self.TAGS_CACHE[cache_key] = {"mtime": file_mtime, "data": data}
-        self.save_tags_cache()
+        try:
+            self.TAGS_CACHE[cache_key] = {"mtime": file_mtime, "data": data}
+            self.save_tags_cache()
+        except SQLITE_ERRORS:
+            pass
+
         return data
 
     def get_tags_raw(self, fname, rel_fname):
@@ -199,8 +211,12 @@ class RepoMap:
         if not lang:
             return
 
-        language = get_language(lang)
-        parser = get_parser(lang)
+        try:
+            language = get_language(lang)
+            parser = get_parser(lang)
+        except Exception as err:
+            print(f"Skipping file {fname}: {err}")
+            return
 
         query_scm = get_scm_fname(lang)
         if not query_scm.exists():
@@ -250,7 +266,8 @@ class RepoMap:
 
         try:
             lexer = guess_lexer_for_filename(fname, code)
-        except ClassNotFound:
+        except Exception:  # On Windows, bad ref to time.clock which is deprecated?
+            # self.io.tool_error(f"Error lexing {fname}")
             return
 
         tokens = list(lexer.get_tokens(code))
@@ -298,16 +315,18 @@ class RepoMap:
             if progress and not showing_bar:
                 progress()
 
-            if not Path(fname).is_file():
-                if fname not in self.warned_files:
-                    if Path(fname).exists():
-                        self.io.tool_error(
-                            f"Repo-map can't include {fname}, it is not a normal file"
-                        )
-                    else:
-                        self.io.tool_error(f"Repo-map can't include {fname}, it no longer exists")
+            try:
+                file_ok = Path(fname).is_file()
+            except OSError:
+                file_ok = False
 
-                self.warned_files.add(fname)
+            if not file_ok:
+                if fname not in self.warned_files:
+                    self.io.tool_warning(f"Repo-map can't include {fname}")
+                    self.io.tool_output(
+                        "Has it been deleted from the file system but not from git?"
+                    )
+                    self.warned_files.add(fname)
                 continue
 
             # dump(fname)
@@ -379,7 +398,11 @@ class RepoMap:
         try:
             ranked = nx.pagerank(G, weight="weight", **pers_args)
         except ZeroDivisionError:
-            return []
+            # Issue #1536
+            try:
+                ranked = nx.pagerank(G, weight="weight")
+            except ZeroDivisionError:
+                return []
 
         # distribute the rank from each source node, across all of its out edges
         ranked_definitions = defaultdict(float)
@@ -396,7 +419,9 @@ class RepoMap:
                 ranked_definitions[(dst, ident)] += data["rank"]
 
         ranked_tags = []
-        ranked_definitions = sorted(ranked_definitions.items(), reverse=True, key=lambda x: x[1])
+        ranked_definitions = sorted(
+            ranked_definitions.items(), reverse=True, key=lambda x: (x[1], x[0])
+        )
 
         # dump(ranked_definitions)
 
@@ -432,12 +457,20 @@ class RepoMap:
         force_refresh=False,
     ):
         # Create a cache key
-        cache_key = (
+        cache_key = [
             tuple(sorted(chat_fnames)) if chat_fnames else None,
             tuple(sorted(other_fnames)) if other_fnames else None,
             max_map_tokens,
-        )
+        ]
 
+        if self.refresh == "auto":
+            cache_key += [
+                tuple(sorted(mentioned_fnames)) if mentioned_fnames else None,
+                tuple(sorted(mentioned_idents)) if mentioned_idents else None,
+            ]
+        cache_key = tuple(cache_key)
+
+        use_cache = False
         if not force_refresh:
             if self.refresh == "manual" and self.last_map:
                 return self.last_map
@@ -493,6 +526,14 @@ class RepoMap:
             mentioned_idents,
             progress=spin.step,
         )
+
+        other_rel_fnames = sorted(set(self.get_rel_fname(fname) for fname in other_fnames))
+        special_fnames = filter_important_files(other_rel_fnames)
+        ranked_tags_fnames = set(tag[0] for tag in ranked_tags)
+        special_fnames = [fn for fn in special_fnames if fn not in ranked_tags_fnames]
+        special_fnames = [(fn,) for fn in special_fnames]
+
+        ranked_tags = special_fnames + ranked_tags
 
         spin.step()
 

@@ -1,7 +1,6 @@
 import difflib
 import math
 import re
-import subprocess
 import sys
 from difflib import SequenceMatcher
 from pathlib import Path
@@ -23,76 +22,41 @@ class EditBlockCoder(Coder):
         content = self.partial_response_content
 
         # might raise ValueError for malformed ORIG/UPD blocks
-        edits = list(find_original_update_blocks(content, self.fence))
+        edits = list(
+            find_original_update_blocks(
+                content,
+                self.fence,
+                self.get_inchat_relative_files(),
+            )
+        )
+
+        self.shell_commands += [edit[1] for edit in edits if edit[0] is None]
+        edits = [edit for edit in edits if edit[0] is not None]
 
         return edits
-
-    def run_interactive_subprocess(self, command):
-        try:
-            result = subprocess.run(
-                command,
-                text=True,
-                shell=True,
-                encoding=self.io.encoding,
-                errors="replace",
-            )
-            if result.returncode == 0:
-                return
-            self.io.tool_error(f"Command '{command}' exited with status {result.returncode}")
-        except Exception as e:
-            self.io.tool_error(f"Error running command '{command}': {str(e)}")
-
-        self.io.tool_output(f"To retry and share output with the LLM: /run {command}")
-        self.io.tool_output("You can find this command in your input history with up-arrow.")
-
-    def handle_shell_commands(self, commands_str):
-        commands = commands_str.strip().splitlines()
-        command_count = sum(
-            1 for cmd in commands if cmd.strip() and not cmd.strip().startswith("#")
-        )
-        prompt = "Run shell command?" if command_count == 1 else "Run shell commands?"
-        if not self.io.confirm_ask(prompt, subject="\n".join(commands)):
-            return
-
-        for command in commands:
-            command = command.strip()
-            if not command or command.startswith("#"):
-                continue
-
-            self.io.tool_output()
-            self.io.tool_output(f"Running {command}")
-            # Add the command to input history
-            self.io.add_to_input_history(f"/run {command.strip()}")
-            result = self.run_interactive_subprocess(command)
-            if result and result.stdout:
-                self.io.tool_output(result.stdout)
 
     def apply_edits(self, edits):
         failed = []
         passed = []
 
         for edit in edits:
-            if edit[0] is None:
-                self.handle_shell_commands(edit[1])
-                continue
-            else:
-                path, original, updated = edit
-                full_path = self.abs_root_path(path)
-                content = self.io.read_text(full_path)
-                new_content = do_replace(full_path, content, original, updated, self.fence)
-                if not new_content:
-                    # try patching any of the other files in the chat
-                    for full_path in self.abs_fnames:
-                        content = self.io.read_text(full_path)
-                        new_content = do_replace(full_path, content, original, updated, self.fence)
-                        if new_content:
-                            break
+            path, original, updated = edit
+            full_path = self.abs_root_path(path)
+            content = self.io.read_text(full_path)
+            new_content = do_replace(full_path, content, original, updated, self.fence)
+            if not new_content:
+                # try patching any of the other files in the chat
+                for full_path in self.abs_fnames:
+                    content = self.io.read_text(full_path)
+                    new_content = do_replace(full_path, content, original, updated, self.fence)
+                    if new_content:
+                        break
 
-                if new_content:
-                    self.io.write_text(full_path, new_content)
-                    passed.append(edit)
-                else:
-                    failed.append(edit)
+            if new_content:
+                self.io.write_text(full_path, new_content)
+                passed.append(edit)
+            else:
+                failed.append(edit)
 
         if not failed:
             return
@@ -401,9 +365,13 @@ def do_replace(fname, content, before_text, after_text, fence=None):
     return new_content
 
 
-HEAD = "<<<<<<< SEARCH"
-DIVIDER = "======="
-UPDATED = ">>>>>>> REPLACE"
+HEAD = r"^<{5,9} SEARCH\s*$"
+DIVIDER = r"^={5,9}\s*$"
+UPDATED = r"^>{5,9} REPLACE\s*$"
+
+HEAD_ERR = "<<<<<<< SEARCH"
+DIVIDER_ERR = "======="
+UPDATED_ERR = ">>>>>>> REPLACE"
 
 separators = "|".join([HEAD, DIVIDER, UPDATED])
 
@@ -431,15 +399,21 @@ def strip_filename(filename, fence):
     filename = filename.strip()
     filename = filename.strip("`")
     filename = filename.strip("*")
-    filename = filename.replace("\\_", "_")
+
+    # https://github.com/Aider-AI/aider/issues/1158
+    # filename = filename.replace("\\_", "_")
 
     return filename
 
 
-def find_original_update_blocks(content, fence=DEFAULT_FENCE):
+def find_original_update_blocks(content, fence=DEFAULT_FENCE, valid_fnames=None):
     lines = content.splitlines(keepends=True)
     i = 0
     current_filename = None
+
+    head_pattern = re.compile(HEAD)
+    divider_pattern = re.compile(DIVIDER)
+    updated_pattern = re.compile(UPDATED)
 
     while i < len(lines):
         line = lines[i]
@@ -459,7 +433,9 @@ def find_original_update_blocks(content, fence=DEFAULT_FENCE):
             "```csh",
             "```tcsh",
         ]
-        if any(line.strip().startswith(start) for start in shell_starts):
+        next_is_editblock = i + 1 < len(lines) and head_pattern.match(lines[i + 1].strip())
+
+        if any(line.strip().startswith(start) for start in shell_starts) and not next_is_editblock:
             shell_content = []
             i += 1
             while i < len(lines) and not lines[i].strip().startswith("```"):
@@ -467,13 +443,19 @@ def find_original_update_blocks(content, fence=DEFAULT_FENCE):
                 i += 1
             if i < len(lines) and lines[i].strip().startswith("```"):
                 i += 1  # Skip the closing ```
+
             yield None, "".join(shell_content)
             continue
 
         # Check for SEARCH/REPLACE blocks
-        if line.strip() == HEAD:
+        if head_pattern.match(line.strip()):
             try:
-                filename = find_filename(lines[max(0, i - 3) : i], fence)
+                # if next line after HEAD exists and is DIVIDER, it's a new file
+                if i + 1 < len(lines) and divider_pattern.match(lines[i + 1].strip()):
+                    filename = find_filename(lines[max(0, i - 3) : i], fence, None)
+                else:
+                    filename = find_filename(lines[max(0, i - 3) : i], fence, valid_fnames)
+
                 if not filename:
                     if current_filename:
                         filename = current_filename
@@ -484,21 +466,27 @@ def find_original_update_blocks(content, fence=DEFAULT_FENCE):
 
                 original_text = []
                 i += 1
-                while i < len(lines) and not lines[i].strip() == DIVIDER:
+                while i < len(lines) and not divider_pattern.match(lines[i].strip()):
                     original_text.append(lines[i])
                     i += 1
 
-                if i >= len(lines) or lines[i].strip() != DIVIDER:
-                    raise ValueError(f"Expected `{DIVIDER}`")
+                if i >= len(lines) or not divider_pattern.match(lines[i].strip()):
+                    raise ValueError(f"Expected `{DIVIDER_ERR}`")
 
                 updated_text = []
                 i += 1
-                while i < len(lines) and not lines[i].strip() in (UPDATED, DIVIDER):
+                while i < len(lines) and not (
+                    updated_pattern.match(lines[i].strip())
+                    or divider_pattern.match(lines[i].strip())
+                ):
                     updated_text.append(lines[i])
                     i += 1
 
-                if i >= len(lines) or lines[i].strip() not in (UPDATED, DIVIDER):
-                    raise ValueError(f"Expected `{UPDATED}` or `{DIVIDER}`")
+                if i >= len(lines) or not (
+                    updated_pattern.match(lines[i].strip())
+                    or divider_pattern.match(lines[i].strip())
+                ):
+                    raise ValueError(f"Expected `{UPDATED_ERR}` or `{DIVIDER_ERR}`")
 
                 yield filename, "".join(original_text), "".join(updated_text)
 
@@ -510,7 +498,7 @@ def find_original_update_blocks(content, fence=DEFAULT_FENCE):
         i += 1
 
 
-def find_filename(lines, fence):
+def find_filename(lines, fence, valid_fnames):
     """
     Deepseek Coder v2 has been doing this:
 
@@ -524,19 +512,54 @@ def find_filename(lines, fence):
 
     This is a more flexible search back for filenames.
     """
+
+    if valid_fnames is None:
+        valid_fnames = []
+
     # Go back through the 3 preceding lines
     lines.reverse()
     lines = lines[:3]
 
+    filenames = []
     for line in lines:
         # If we find a filename, done
         filename = strip_filename(line, fence)
         if filename:
-            return filename
+            filenames.append(filename)
 
         # Only continue as long as we keep seeing fences
         if not line.startswith(fence[0]):
-            return
+            break
+
+    if not filenames:
+        return
+
+    # pick the *best* filename found
+
+    # Check for exact match first
+    for fname in filenames:
+        if fname in valid_fnames:
+            return fname
+
+    # Check for partial match (basename match)
+    for fname in filenames:
+        for vfn in valid_fnames:
+            if fname == Path(vfn).name:
+                return vfn
+
+    # Perform fuzzy matching with valid_fnames
+    for fname in filenames:
+        close_matches = difflib.get_close_matches(fname, valid_fnames, n=1, cutoff=0.8)
+        if len(close_matches) == 1:
+            return close_matches[0]
+
+    # If no fuzzy match, look for a file w/extension
+    for fname in filenames:
+        if "." in fname:
+            return fname
+
+    if filenames:
+        return filenames[0]
 
 
 def find_similar_lines(search_lines, content_lines, threshold=0.6):

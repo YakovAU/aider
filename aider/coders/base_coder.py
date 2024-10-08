@@ -14,29 +14,24 @@ import threading
 import time
 import traceback
 from collections import defaultdict
-from dataclasses import dataclass, field
 from datetime import datetime
 from json.decoder import JSONDecodeError
 from pathlib import Path
-from typing import List
-
-import git
-from rich.console import Console, Text
-from rich.markdown import Markdown
 
 from aider import __version__, models, prompts, urls, utils
 from aider.commands import Commands
 from aider.history import ChatSummary
-from aider.io import InputOutput
+from aider.io import ConfirmGroup, InputOutput
 from aider.linter import Linter
 from aider.llm import litellm
-from aider.mdstream import MarkdownStream
-from aider.repo import GitRepo
+from aider.repo import ANY_GIT_ERROR, GitRepo
 from aider.repomap import RepoMap
+from aider.run_cmd import run_cmd
 from aider.sendchat import retry_exceptions, send_completion
-from aider.utils import format_content, format_messages, is_image_file
+from aider.utils import format_content, format_messages, format_tokens, is_image_file
 
 from ..dump import dump  # noqa: F401
+from .chat_chunks import ChatChunks
 
 
 class MissingAPIKeyError(ValueError):
@@ -51,55 +46,14 @@ def wrap_fence(name):
     return f"<{name}>", f"</{name}>"
 
 
-@dataclass
-class ChatChunks:
-    system: List = field(default_factory=list)
-    examples: List = field(default_factory=list)
-    done: List = field(default_factory=list)
-    repo: List = field(default_factory=list)
-    readonly_files: List = field(default_factory=list)
-    chat_files: List = field(default_factory=list)
-    cur: List = field(default_factory=list)
-    reminder: List = field(default_factory=list)
-
-    def all_messages(self):
-        return (
-            self.system
-            + self.examples
-            + self.readonly_files
-            + self.repo
-            + self.done
-            + self.chat_files
-            + self.cur
-            + self.reminder
-        )
-
-    def add_cache_control_headers(self):
-        if self.examples:
-            self.add_cache_control(self.examples)
-        else:
-            self.add_cache_control(self.system)
-
-        if self.readonly_files:
-            self.add_cache_control(self.readonly_files)
-        else:
-            self.add_cache_control(self.repo)
-
-        self.add_cache_control(self.chat_files)
-
-    def add_cache_control(self, messages):
-        if not messages:
-            return
-
-        content = messages[-1]["content"]
-        if type(content) is str:
-            content = dict(
-                type="text",
-                text=content,
-            )
-        content["cache_control"] = {"type": "ephemeral"}
-
-        messages[-1]["content"] = [content]
+all_fences = [
+    ("``" + "`", "``" + "`"),
+    wrap_fence("source"),
+    wrap_fence("code"),
+    wrap_fence("pre"),
+    wrap_fence("codeblock"),
+    wrap_fence("sourcecode"),
+]
 
 
 class Coder:
@@ -131,6 +85,11 @@ class Coder:
     message_tokens_sent = 0
     message_tokens_received = 0
     add_cache_headers = False
+    cache_warming_thread = None
+    num_cache_warming_pings = 0
+    suggest_shell_commands = True
+    ignore_mentions = None
+    chat_language = None
 
     @classmethod
     def create(
@@ -197,7 +156,9 @@ class Coder:
         raise ValueError(f"Unknown edit format {edit_format}")
 
     def clone(self, **kwargs):
-        return Coder.create(from_coder=self, **kwargs)
+        new_coder = Coder.create(from_coder=self, **kwargs)
+        new_coder.ignore_mentions = self.ignore_mentions
+        return new_coder
 
     def get_announcements(self):
         lines = []
@@ -213,11 +174,18 @@ class Coder:
             prefix = "Model"
 
         output = f"{prefix}: {main_model.name} with {self.edit_format} edit format"
-        if self.add_cache_headers:
+        if self.add_cache_headers or main_model.caches_by_default:
             output += ", prompt cache"
         if main_model.info.get("supports_assistant_prefill"):
             output += ", infinite output"
         lines.append(output)
+
+        if self.edit_format == "architect":
+            output = (
+                f"Editor model: {main_model.editor_model.name} with"
+                f" {main_model.editor_edit_format} edit format"
+            )
+            lines.append(output)
 
         if weak_model is not main_model:
             output = f"Weak model: {weak_model.name}"
@@ -227,6 +195,7 @@ class Coder:
         if self.repo:
             rel_repo_dir = self.repo.get_rel_repo_dir()
             num_files = len(self.repo.get_tracked_files())
+
             lines.append(f"Git repo: {rel_repo_dir} with {num_files:,} files")
             if num_files > 1000:
                 lines.append(
@@ -246,7 +215,7 @@ class Coder:
                 if map_tokens > max_map_tokens:
                     lines.append(
                         f"Warning: map-tokens > {max_map_tokens} is not recommended as too much"
-                        " irrelevant code can confuse GPT."
+                        " irrelevant code can confuse LLMs."
                     )
             else:
                 lines.append("Repo-map: disabled because map_tokens == 0")
@@ -275,8 +244,6 @@ class Coder:
         dry_run=False,
         map_tokens=1024,
         verbose=False,
-        assistant_output_color="blue",
-        code_theme="default",
         stream=True,
         use_git=True,
         cur_messages=None,
@@ -293,11 +260,20 @@ class Coder:
         total_cost=0.0,
         map_refresh="auto",
         cache_prompts=False,
+        num_cache_warming_pings=0,
+        suggest_shell_commands=True,
+        chat_language=None,
     ):
+        self.chat_language = chat_language
         self.commit_before_message = []
         self.aider_commit_hashes = set()
         self.rejected_urls = set()
         self.abs_root_path_cache = {}
+        self.ignore_mentions = set()
+
+        self.suggest_shell_commands = suggest_shell_commands
+
+        self.num_cache_warming_pings = num_cache_warming_pings
 
         if not fnames:
             fnames = []
@@ -333,21 +309,16 @@ class Coder:
         self.io = io
         self.stream = stream
 
+        self.shell_commands = []
+
         if not auto_commits:
             dirty_commits = False
 
         self.auto_commits = auto_commits
         self.dirty_commits = dirty_commits
-        self.assistant_output_color = assistant_output_color
-        self.code_theme = code_theme
 
         self.dry_run = dry_run
         self.pretty = self.io.pretty
-
-        if self.pretty:
-            self.console = Console()
-        else:
-            self.console = Console(force_terminal=False, no_color=True)
 
         self.main_model = main_model
 
@@ -376,25 +347,28 @@ class Coder:
 
         for fname in fnames:
             fname = Path(fname)
+            if self.repo and self.repo.ignored_file(fname):
+                self.io.tool_warning(f"Skipping {fname} that matches aiderignore spec.")
+                continue
+
             if not fname.exists():
-                self.io.tool_output(f"Creating empty file {fname}")
-                fname.parent.mkdir(parents=True, exist_ok=True)
-                fname.touch()
+                if utils.touch_file(fname):
+                    self.io.tool_output(f"Creating empty file {fname}")
+                else:
+                    self.io.tool_warning(f"Can not create {fname}, skipping.")
+                    continue
 
             if not fname.is_file():
-                raise ValueError(f"{fname} is not a file")
+                self.io.tool_warning(f"Skipping {fname} that is not a normal file.")
+                continue
 
             fname = str(fname.resolve())
-
-            if self.repo and self.repo.ignored_file(fname):
-                self.io.tool_error(f"Skipping {fname} that matches aiderignore spec.")
-                continue
 
             self.abs_fnames.add(fname)
             self.check_added_files()
 
         if not self.repo:
-            self.find_common_root()
+            self.root = utils.find_common_root(self.abs_fnames)
 
         if read_only_fnames:
             self.abs_read_only_fnames = set()
@@ -403,7 +377,7 @@ class Coder:
                 if os.path.exists(abs_fname):
                     self.abs_read_only_fnames.add(abs_fname)
                 else:
-                    self.io.tool_error(f"Error: Read-only file {fname} does not exist. Skipping.")
+                    self.io.tool_warning(f"Error: Read-only file {fname} does not exist. Skipping.")
 
         if map_tokens is None:
             use_repo_map = main_model.use_repo_map
@@ -446,7 +420,7 @@ class Coder:
         self.linter = Linter(root=self.root, encoding=io.encoding)
         self.auto_lint = auto_lint
         self.setup_lint_cmds(lint_cmds)
-
+        self.lint_cmds = lint_cmds
         self.auto_test = auto_test
         self.test_cmd = test_cmd
 
@@ -473,16 +447,6 @@ class Coder:
             self.io.tool_output(line, bold=bold)
             bold = False
 
-    def find_common_root(self):
-        if len(self.abs_fnames) == 1:
-            self.root = os.path.dirname(list(self.abs_fnames)[0])
-        elif self.abs_fnames:
-            self.root = os.path.commonpath(list(self.abs_fnames))
-        else:
-            self.root = os.getcwd()
-
-        self.root = utils.safe_abs_path(self.root)
-
     def add_rel_fname(self, rel_fname):
         self.abs_fnames.add(self.abs_root_path(rel_fname))
         self.check_added_files()
@@ -503,14 +467,7 @@ class Coder:
         self.abs_root_path_cache[key] = res
         return res
 
-    fences = [
-        ("``" + "`", "``" + "`"),
-        wrap_fence("source"),
-        wrap_fence("code"),
-        wrap_fence("pre"),
-        wrap_fence("codeblock"),
-        wrap_fence("sourcecode"),
-    ]
+    fences = all_fences
     fence = fences[0]
 
     def show_pretty(self):
@@ -529,7 +486,7 @@ class Coder:
 
             if content is None:
                 relative_fname = self.get_rel_fname(fname)
-                self.io.tool_error(f"Dropping {relative_fname} from the chat.")
+                self.io.tool_warning(f"Dropping {relative_fname} from the chat.")
                 self.abs_fnames.remove(fname)
             else:
                 yield fname, content
@@ -543,9 +500,10 @@ class Coder:
             if content is not None:
                 all_content += content + "\n"
 
+        lines = all_content.splitlines()
         good = False
         for fence_open, fence_close in self.fences:
-            if fence_open in all_content or fence_close in all_content:
+            if any(line.startswith(fence_open) or line.startswith(fence_close) for line in lines):
                 continue
             good = True
             break
@@ -554,7 +512,7 @@ class Coder:
             self.fence = (fence_open, fence_close)
         else:
             self.fence = self.fences[0]
-            self.io.tool_error(
+            self.io.tool_warning(
                 "Unable to find a fencing strategy! Falling back to:"
                 f" {self.fence[0]}...{self.fence[1]}"
             )
@@ -697,7 +655,7 @@ class Coder:
         if self.abs_fnames:
             files_content = self.gpt_prompts.files_content_prefix
             files_content += self.get_files_content()
-            files_reply = "Ok, any changes I propose will be to those files."
+            files_reply = self.gpt_prompts.files_content_assistant_reply
         elif self.get_repo_map() and self.gpt_prompts.files_no_full_files_with_repo_map:
             files_content = self.gpt_prompts.files_no_full_files_with_repo_map
             files_reply = self.gpt_prompts.files_no_full_files_with_repo_map_reply
@@ -749,13 +707,15 @@ class Coder:
         yield from self.send_message(user_message)
 
     def init_before_message(self):
+        self.aider_edited_files = set()
         self.reflected_message = None
         self.num_reflections = 0
         self.lint_outcome = None
         self.test_outcome = None
-        self.edit_outcome = None
+        self.shell_commands = []
+
         if self.repo:
-            self.commit_before_message.append(self.repo.get_head())
+            self.commit_before_message.append(self.repo.get_head_commit_sha())
 
     def run(self, with_message=None, preproc=True):
         try:
@@ -778,9 +738,7 @@ class Coder:
         inchat_files = self.get_inchat_relative_files()
         read_only_files = [self.get_rel_fname(fname) for fname in self.abs_read_only_fnames]
         all_files = sorted(set(inchat_files + read_only_files))
-        edit_format = (
-            "code" if self.edit_format == self.main_model.edit_format else self.edit_format
-        )
+        edit_format = "" if self.edit_format == self.main_model.edit_format else self.edit_format
         return self.io.get_input(
             self.root,
             all_files,
@@ -818,7 +776,7 @@ class Coder:
                 break
 
             if self.num_reflections >= self.max_reflections:
-                self.io.tool_error(f"Only {self.max_reflections} reflections allowed, stopping.")
+                self.io.tool_warning(f"Only {self.max_reflections} reflections allowed, stopping.")
                 return
 
             self.num_reflections += 1
@@ -828,11 +786,14 @@ class Coder:
         url_pattern = re.compile(r"(https?://[^\s/$.?#].[^\s]*[^\s,.])")
         urls = list(set(url_pattern.findall(inp)))  # Use set to remove duplicates
         added_urls = []
+        group = ConfirmGroup(urls)
         for url in urls:
             if url not in self.rejected_urls:
-                if self.io.confirm_ask("Add URL to the chat?", subject=url):
+                if self.io.confirm_ask(
+                    "Add URL to the chat?", subject=url, group=group, allow_never=True
+                ):
                     inp += "\n\n"
-                    inp += self.commands.cmd_web(url, paginate=False)
+                    inp += self.commands.cmd_web(url)
                     added_urls.append(url)
                 else:
                     self.rejected_urls.add(url)
@@ -844,10 +805,10 @@ class Coder:
 
         thresh = 2  # seconds
         if self.last_keyboard_interrupt and now - self.last_keyboard_interrupt < thresh:
-            self.io.tool_error("\n\n^C KeyboardInterrupt")
+            self.io.tool_warning("\n\n^C KeyboardInterrupt")
             sys.exit()
 
-        self.io.tool_error("\n\n^C again to exit")
+        self.io.tool_warning("\n\n^C again to exit")
 
         self.last_keyboard_interrupt = now
 
@@ -867,7 +828,7 @@ class Coder:
         try:
             self.summarized_done_messages = self.summarizer.summarize(self.done_messages)
         except ValueError as err:
-            self.io.tool_error(err.args[0])
+            self.io.tool_warning(err.args[0])
 
         if self.verbose:
             self.io.tool_output("Finished summarizing chat history.")
@@ -895,6 +856,9 @@ class Coder:
         self.cur_messages = []
 
     def get_user_language(self):
+        if self.chat_language:
+            return self.chat_language
+
         try:
             lang = locale.getlocale()[0]
             if lang:
@@ -911,29 +875,66 @@ class Coder:
 
         return None
 
-    def fmt_system_prompt(self, prompt):
-        lazy_prompt = self.gpt_prompts.lazy_prompt if self.main_model.lazy else ""
-
+    def get_platform_info(self):
         platform_text = f"- Platform: {platform.platform()}\n"
-        if os.name == "nt":
-            var = "COMSPEC"
-        else:
-            var = "SHELL"
-
-        val = os.getenv(var)
-        platform_text += f"- Shell: {var}={val}\n"
+        shell_var = "COMSPEC" if os.name == "nt" else "SHELL"
+        shell_val = os.getenv(shell_var)
+        platform_text += f"- Shell: {shell_var}={shell_val}\n"
 
         user_lang = self.get_user_language()
         if user_lang:
             platform_text += f"- Language: {user_lang}\n"
 
         dt = datetime.now().astimezone().strftime("%Y-%m-%d")
-        platform_text += f"- Current date: {dt}"
+        platform_text += f"- Current date: {dt}\n"
+
+        if self.repo:
+            platform_text += "- The user is operating inside a git repository\n"
+
+        if self.lint_cmds:
+            if self.auto_lint:
+                platform_text += (
+                    "- The user's pre-commit runs these lint commands, don't suggest running"
+                    " them:\n"
+                )
+            else:
+                platform_text += "- The user prefers these lint commands:\n"
+            for lang, cmd in self.lint_cmds.items():
+                if lang is None:
+                    platform_text += f"  - {cmd}\n"
+                else:
+                    platform_text += f"  - {lang}: {cmd}\n"
+
+        if self.test_cmd:
+            if self.auto_test:
+                platform_text += (
+                    "- The user's pre-commit runs this test command, don't suggest running them: "
+                )
+            else:
+                platform_text += "- The user prefers this test command: "
+            platform_text += self.test_cmd + "\n"
+
+        return platform_text
+
+    def fmt_system_prompt(self, prompt):
+        lazy_prompt = self.gpt_prompts.lazy_prompt if self.main_model.lazy else ""
+        platform_text = self.get_platform_info()
+
+        if self.suggest_shell_commands:
+            shell_cmd_prompt = self.gpt_prompts.shell_cmd_prompt.format(platform=platform_text)
+            shell_cmd_reminder = self.gpt_prompts.shell_cmd_reminder.format(platform=platform_text)
+        else:
+            shell_cmd_prompt = self.gpt_prompts.no_shell_cmd_prompt.format(platform=platform_text)
+            shell_cmd_reminder = self.gpt_prompts.no_shell_cmd_reminder.format(
+                platform=platform_text
+            )
 
         prompt = prompt.format(
             fence=self.fence,
             lazy_prompt=lazy_prompt,
             platform=platform_text,
+            shell_cmd_prompt=shell_cmd_prompt,
+            shell_cmd_reminder=shell_cmd_reminder,
         )
         return prompt
 
@@ -975,9 +976,16 @@ class Coder:
 
         chunks = ChatChunks()
 
-        chunks.system = [
-            dict(role="system", content=main_sys),
-        ]
+        if self.main_model.use_system_prompt:
+            chunks.system = [
+                dict(role="system", content=main_sys),
+            ]
+        else:
+            chunks.system = [
+                dict(role="user", content=main_sys),
+                dict(role="assistant", content="Ok."),
+            ]
+
         chunks.examples = example_messages
 
         self.summarize_end()
@@ -1037,25 +1045,76 @@ class Coder:
         if self.add_cache_headers:
             chunks.add_cache_control_headers()
 
-        msgs = chunks.all_messages()
-        return msgs
+        return chunks
+
+    def warm_cache(self, chunks):
+        if not self.add_cache_headers:
+            return
+        if not self.num_cache_warming_pings:
+            return
+
+        delay = 5 * 60 - 5
+        self.next_cache_warm = time.time() + delay
+        self.warming_pings_left = self.num_cache_warming_pings
+        self.cache_warming_chunks = chunks
+
+        if self.cache_warming_thread:
+            return
+
+        def warm_cache_worker():
+            while True:
+                time.sleep(1)
+                if self.warming_pings_left <= 0:
+                    continue
+                now = time.time()
+                if now < self.next_cache_warm:
+                    continue
+
+                self.warming_pings_left -= 1
+                self.next_cache_warm = time.time() + delay
+
+                kwargs = dict(self.main_model.extra_params) or dict()
+                kwargs["max_tokens"] = 1
+
+                try:
+                    completion = litellm.completion(
+                        model=self.main_model.name,
+                        messages=self.cache_warming_chunks.cacheable_messages(),
+                        stream=False,
+                        **kwargs,
+                    )
+                except Exception as err:
+                    self.io.tool_warning(f"Cache warming error: {str(err)}")
+                    continue
+
+                cache_hit_tokens = getattr(
+                    completion.usage, "prompt_cache_hit_tokens", 0
+                ) or getattr(completion.usage, "cache_read_input_tokens", 0)
+
+                if self.verbose:
+                    self.io.tool_output(f"Warmed {format_tokens(cache_hit_tokens)} cached tokens.")
+
+        self.cache_warming_thread = threading.Timer(0, warm_cache_worker)
+        self.cache_warming_thread.daemon = True
+        self.cache_warming_thread.start()
+
+        return chunks
 
     def send_message(self, inp):
-        self.aider_edited_files = None
-
         self.cur_messages += [
             dict(role="user", content=inp),
         ]
 
-        messages = self.format_messages()
+        chunks = self.format_messages()
+        messages = chunks.all_messages()
+        self.warm_cache(chunks)
 
         if self.verbose:
             utils.show_messages(messages, functions=self.functions)
 
         self.multi_response_content = ""
         if self.show_pretty() and self.stream:
-            mdargs = dict(style=self.assistant_output_color, code_theme=self.code_theme)
-            self.mdstream = MarkdownStream(mdargs=mdargs)
+            self.mdstream = self.io.get_assistant_mdstream()
         else:
             self.mdstream = None
 
@@ -1070,7 +1129,7 @@ class Coder:
                     yield from self.send(messages, functions=self.functions)
                     break
                 except retry_exceptions() as err:
-                    self.io.tool_error(str(err))
+                    self.io.tool_warning(str(err))
                     retry_delay *= 2
                     if retry_delay > 60:
                         break
@@ -1134,41 +1193,49 @@ class Coder:
         else:
             content = ""
 
+        try:
+            self.reply_completed()
+        except KeyboardInterrupt:
+            interrupted = True
+
         if interrupted:
             content += "\n^C KeyboardInterrupt"
             self.cur_messages += [dict(role="assistant", content=content)]
             return
 
         edited = self.apply_updates()
-        if self.reflected_message:
-            self.edit_outcome = False
-            self.update_cur_messages(set())
-            return
-        if edited:
-            self.edit_outcome = True
 
-        self.update_cur_messages(edited)
+        self.update_cur_messages()
 
         if edited:
-            self.aider_edited_files = edited
-            if self.repo and self.auto_commits and not self.dry_run:
-                saved_message = self.auto_commit(edited)
-            elif hasattr(self.gpt_prompts, "files_content_gpt_edits_no_repo"):
+            self.aider_edited_files.update(edited)
+            saved_message = self.auto_commit(edited)
+
+            if not saved_message and hasattr(self.gpt_prompts, "files_content_gpt_edits_no_repo"):
                 saved_message = self.gpt_prompts.files_content_gpt_edits_no_repo
-            else:
-                saved_message = None
 
             self.move_back_cur_messages(saved_message)
 
+        if self.reflected_message:
+            return
+
         if edited and self.auto_lint:
             lint_errors = self.lint_edited(edited)
+            self.auto_commit(edited, context="Ran the linter")
             self.lint_outcome = not lint_errors
             if lint_errors:
                 ok = self.io.confirm_ask("Attempt to fix lint errors?")
                 if ok:
                     self.reflected_message = lint_errors
-                    self.update_cur_messages(set())
+                    self.update_cur_messages()
                     return
+
+        shared_output = self.run_shell_commands()
+        if shared_output:
+            self.cur_messages += [
+                dict(role="user", content=shared_output),
+                dict(role="assistant", content="Ok"),
+            ]
 
         if edited and self.auto_test:
             test_errors = self.commands.cmd_test(self.test_cmd)
@@ -1177,7 +1244,7 @@ class Coder:
                 ok = self.io.confirm_ask("Attempt to fix test errors?")
                 if ok:
                     self.reflected_message = test_errors
-                    self.update_cur_messages(set())
+                    self.update_cur_messages()
                     return
 
         add_rel_files_message = self.check_for_file_mentions(content)
@@ -1187,13 +1254,16 @@ class Coder:
             else:
                 self.reflected_message = add_rel_files_message
 
+    def reply_completed(self):
+        pass
+
     def show_exhausted_error(self):
         output_tokens = 0
         if self.partial_response_content:
             output_tokens = self.main_model.token_count(self.partial_response_content)
         max_output_tokens = self.main_model.info.get("max_output_tokens") or 0
 
-        input_tokens = self.main_model.token_count(self.format_messages())
+        input_tokens = self.main_model.token_count(self.format_messages().all_messages())
         max_input_tokens = self.main_model.info.get("max_input_tokens") or 0
 
         total_tokens = input_tokens + output_tokens
@@ -1254,20 +1324,12 @@ class Coder:
                 res += errors
                 res += "\n"
 
-        # Commit any formatting changes that happened
-        if self.repo and self.auto_commits and not self.dry_run:
-            commit_res = self.repo.commit(
-                fnames=fnames, context="The linter made edits to these files", aider_edits=True
-            )
-            if commit_res:
-                self.show_auto_commit_outcome(commit_res)
-
         if res:
-            self.io.tool_error(res)
+            self.io.tool_warning(res)
 
         return res
 
-    def update_cur_messages(self, edited):
+    def update_cur_messages(self):
         if self.partial_response_content:
             self.cur_messages += [dict(role="assistant", content=self.partial_response_content)]
         if self.partial_response_function_call:
@@ -1316,17 +1378,22 @@ class Coder:
     def check_for_file_mentions(self, content):
         mentioned_rel_fnames = self.get_file_mentions(content)
 
-        if not mentioned_rel_fnames:
+        new_mentions = mentioned_rel_fnames - self.ignore_mentions
+
+        if not new_mentions:
             return
 
-        add_files = "\n".join(mentioned_rel_fnames) + "\n"
-        if not self.io.confirm_ask("Add these files to the chat?", subject=add_files):
-            return
+        added_fnames = []
+        group = ConfirmGroup(new_mentions)
+        for rel_fname in sorted(new_mentions):
+            if self.io.confirm_ask(f"Add {rel_fname} to the chat?", group=group, allow_never=True):
+                self.add_rel_fname(rel_fname)
+                added_fnames.append(rel_fname)
+            else:
+                self.ignore_mentions.add(rel_fname)
 
-        for rel_fname in mentioned_rel_fnames:
-            self.add_rel_fname(rel_fname)
-
-        return prompts.added_files.format(fnames=", ".join(mentioned_rel_fnames))
+        if added_fnames:
+            return prompts.added_files.format(fnames=", ".join(added_fnames))
 
     def send(self, messages, model=None, functions=None):
         if not model:
@@ -1337,6 +1404,11 @@ class Coder:
 
         self.io.log_llm_history("TO LLM", format_messages(messages))
 
+        if self.main_model.use_temperature:
+            temp = self.temperature
+        else:
+            temp = None
+
         completion = None
         try:
             hash_object, completion = send_completion(
@@ -1344,9 +1416,8 @@ class Coder:
                 messages,
                 functions,
                 self.stream,
-                self.temperature,
-                extra_headers=model.extra_headers,
-                max_tokens=model.max_tokens,
+                temp,
+                extra_params=model.extra_params,
             )
             self.chat_completion_call_hashes.append(hash_object.hexdigest())
 
@@ -1409,14 +1480,7 @@ class Coder:
             raise Exception("No data found in LLM response!")
 
         show_resp = self.render_incremental_response(True)
-        if self.show_pretty():
-            show_resp = Markdown(
-                show_resp, style=self.assistant_output_color, code_theme=self.code_theme
-            )
-        else:
-            show_resp = Text(show_resp or "<no response>")
-
-        self.io.console.print(show_resp)
+        self.io.assistant_output(show_resp, pretty=self.show_pretty())
 
         if (
             hasattr(completion.choices[0], "finish_reason")
@@ -1504,14 +1568,6 @@ class Coder:
 
         self.message_tokens_received += completion_tokens
 
-        def format_tokens(count):
-            if count < 1000:
-                return f"{count}"
-            elif count < 10000:
-                return f"{count / 1000:.1f}k"
-            else:
-                return f"{round(count / 1000)}k"
-
         tokens_report = f"Tokens: {format_tokens(self.message_tokens_sent)} sent"
 
         if cache_write_tokens:
@@ -1597,7 +1653,10 @@ class Coder:
         return cur + new
 
     def get_rel_fname(self, fname):
-        return os.path.relpath(fname, self.root)
+        try:
+            return os.path.relpath(fname, self.root)
+        except ValueError:
+            return fname
 
     def get_inchat_relative_files(self):
         files = [self.get_rel_fname(fname) for fname in self.abs_fnames]
@@ -1624,12 +1683,6 @@ class Coder:
         files = self.get_all_relative_files()
         files = [self.abs_root_path(path) for path in files]
         return files
-
-    def get_last_modified(self):
-        files = [Path(fn) for fn in self.get_all_abs_files() if Path(fn).exists()]
-        if not files:
-            return 0
-        return max(path.stat().st_mtime for path in files)
 
     def get_addable_relative_files(self):
         all_files = set(self.get_all_relative_files())
@@ -1666,12 +1719,13 @@ class Coder:
 
         if not Path(full_path).exists():
             if not self.io.confirm_ask("Create new file?", subject=path):
-                self.io.tool_error(f"Skipping edits to {path}")
+                self.io.tool_output(f"Skipping edits to {path}")
                 return
 
             if not self.dry_run:
-                Path(full_path).parent.mkdir(parents=True, exist_ok=True)
-                Path(full_path).touch()
+                if not utils.touch_file(full_path):
+                    self.io.tool_error(f"Unable to create {path}, skipping edits.")
+                    return
 
                 # Seems unlikely that we needed to create the file, but it was
                 # actually already part of the repo.
@@ -1687,7 +1741,7 @@ class Coder:
             "Allow edits to file that has not been added to the chat?",
             subject=path,
         ):
-            self.io.tool_error(f"Skipping edits to {path}")
+            self.io.tool_output(f"Skipping edits to {path}")
             return
 
         if need_to_add:
@@ -1722,8 +1776,8 @@ class Coder:
         if tokens < warn_number_of_tokens:
             return
 
-        self.io.tool_error("Warning: it's best to only add files that need changes to the chat.")
-        self.io.tool_error(urls.edit_errors)
+        self.io.tool_warning("Warning: it's best to only add files that need changes to the chat.")
+        self.io.tool_warning(urls.edit_errors)
         self.warning_given = True
 
     def prepare_to_edit(self, edits):
@@ -1737,6 +1791,8 @@ class Coder:
             if path is None:
                 res.append(edit)
                 continue
+            if path == "python":
+                dump(edits)
             if path in seen:
                 allowed = seen[path]
             else:
@@ -1751,31 +1807,29 @@ class Coder:
 
         return res
 
-    def update_files(self):
-        edits = self.get_edits()
-        edits = self.prepare_to_edit(edits)
-        self.apply_edits(edits)
-        return set(edit[0] for edit in edits if edit[0])
-
     def apply_updates(self):
+        edited = set()
         try:
-            edited = self.update_files()
+            edits = self.get_edits()
+            edits = self.prepare_to_edit(edits)
+            edited = set(edit[0] for edit in edits)
+            self.apply_edits(edits)
         except ValueError as err:
             self.num_malformed_responses += 1
 
             err = err.args[0]
 
             self.io.tool_error("The LLM did not conform to the edit format.")
-            self.io.tool_error(urls.edit_errors)
-            self.io.tool_error()
-            self.io.tool_error(str(err), strip=False)
+            self.io.tool_output(urls.edit_errors)
+            self.io.tool_output()
+            self.io.tool_output(str(err))
 
             self.reflected_message = str(err)
-            return
+            return edited
 
-        except git.exc.GitCommandError as err:
+        except ANY_GIT_ERROR as err:
             self.io.tool_error(str(err))
-            return
+            return edited
         except Exception as err:
             self.io.tool_error("Exception while updating files:")
             self.io.tool_error(str(err), strip=False)
@@ -1783,7 +1837,7 @@ class Coder:
             traceback.print_exc()
 
             self.reflected_message = str(err)
-            return
+            return edited
 
         for path in edited:
             if self.dry_run:
@@ -1830,19 +1884,27 @@ class Coder:
 
         return context
 
-    def auto_commit(self, edited):
-        context = self.get_context_from_history(self.cur_messages)
-        res = self.repo.commit(fnames=edited, context=context, aider_edits=True)
-        if res:
-            self.show_auto_commit_outcome(res)
-            commit_hash, commit_message = res
-            return self.gpt_prompts.files_content_gpt_edits.format(
-                hash=commit_hash,
-                message=commit_message,
-            )
+    def auto_commit(self, edited, context=None):
+        if not self.repo or not self.auto_commits or self.dry_run:
+            return
 
-        self.io.tool_output("No changes made to git tracked files.")
-        return self.gpt_prompts.files_content_gpt_no_edits
+        if not context:
+            context = self.get_context_from_history(self.cur_messages)
+
+        try:
+            res = self.repo.commit(fnames=edited, context=context, aider_edits=True)
+            if res:
+                self.show_auto_commit_outcome(res)
+                commit_hash, commit_message = res
+                return self.gpt_prompts.files_content_gpt_edits.format(
+                    hash=commit_hash,
+                    message=commit_message,
+                )
+
+            return self.gpt_prompts.files_content_gpt_no_edits
+        except ANY_GIT_ERROR as err:
+            self.io.tool_error(f"Unable to commit: {str(err)}")
+            return
 
     def show_auto_commit_outcome(self, res):
         commit_hash, commit_message = res
@@ -1855,7 +1917,7 @@ class Coder:
     def show_undo_hint(self):
         if not self.commit_before_message:
             return
-        if self.commit_before_message[-1] != self.repo.get_head():
+        if self.commit_before_message[-1] != self.repo.get_head_commit_sha():
             self.io.tool_output("You can use /undo to undo and discard each aider commit.")
 
     def dirty_commit(self):
@@ -1877,3 +1939,55 @@ class Coder:
 
     def apply_edits(self, edits):
         return
+
+    def run_shell_commands(self):
+        if not self.suggest_shell_commands:
+            return ""
+
+        done = set()
+        group = ConfirmGroup(set(self.shell_commands))
+        accumulated_output = ""
+        for command in self.shell_commands:
+            if command in done:
+                continue
+            done.add(command)
+            output = self.handle_shell_commands(command, group)
+            if output:
+                accumulated_output += output + "\n\n"
+        return accumulated_output
+
+    def handle_shell_commands(self, commands_str, group):
+        commands = commands_str.strip().splitlines()
+        command_count = sum(
+            1 for cmd in commands if cmd.strip() and not cmd.strip().startswith("#")
+        )
+        prompt = "Run shell command?" if command_count == 1 else "Run shell commands?"
+        if not self.io.confirm_ask(
+            prompt,
+            subject="\n".join(commands),
+            explicit_yes_required=True,
+            group=group,
+            allow_never=True,
+        ):
+            return
+
+        accumulated_output = ""
+        for command in commands:
+            command = command.strip()
+            if not command or command.startswith("#"):
+                continue
+
+            self.io.tool_output()
+            self.io.tool_output(f"Running {command}")
+            # Add the command to input history
+            self.io.add_to_input_history(f"/run {command.strip()}")
+            exit_status, output = run_cmd(command, error_print=self.io.tool_error)
+            if output:
+                accumulated_output += f"Output from {command}\n{output}\n"
+
+        if accumulated_output.strip() and not self.io.confirm_ask(
+            "Add command output to the chat?", allow_never=True
+        ):
+            accumulated_output = ""
+
+        return accumulated_output

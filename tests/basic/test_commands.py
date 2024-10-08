@@ -8,6 +8,7 @@ from pathlib import Path
 from unittest import TestCase, mock
 
 import git
+import pyperclip
 
 from aider.coders import Coder
 from aider.commands import Commands, SwitchCoder
@@ -45,8 +46,106 @@ class TestCommands(TestCase):
         self.assertTrue(os.path.exists("foo.txt"))
         self.assertTrue(os.path.exists("bar.txt"))
 
+    def test_cmd_copy(self):
+        # Initialize InputOutput and Coder instances
+        io = InputOutput(pretty=False, yes=True)
+        coder = Coder.create(self.GPT35, None, io)
+        commands = Commands(io, coder)
+
+        # Add some assistant messages to the chat history
+        coder.done_messages = [
+            {"role": "assistant", "content": "First assistant message"},
+            {"role": "user", "content": "User message"},
+            {"role": "assistant", "content": "Second assistant message"},
+        ]
+
+        # Mock pyperclip.copy and io.tool_output
+        with (
+            mock.patch("pyperclip.copy") as mock_copy,
+            mock.patch.object(io, "tool_output") as mock_tool_output,
+        ):
+            # Invoke the /copy command
+            commands.cmd_copy("")
+
+            # Assert pyperclip.copy was called with the last assistant message
+            mock_copy.assert_called_once_with("Second assistant message")
+
+            # Assert that tool_output was called with the expected preview
+            expected_preview = (
+                "Copied last assistant message to clipboard. Preview: Second assistant message"
+            )
+            mock_tool_output.assert_any_call(expected_preview)
+
+    def test_cmd_copy_with_cur_messages(self):
+        # Initialize InputOutput and Coder instances
+        io = InputOutput(pretty=False, yes=True)
+        coder = Coder.create(self.GPT35, None, io)
+        commands = Commands(io, coder)
+
+        # Add messages to done_messages and cur_messages
+        coder.done_messages = [
+            {"role": "assistant", "content": "First assistant message in done_messages"},
+            {"role": "user", "content": "User message in done_messages"},
+        ]
+        coder.cur_messages = [
+            {"role": "assistant", "content": "Latest assistant message in cur_messages"},
+        ]
+
+        # Mock pyperclip.copy and io.tool_output
+        with (
+            mock.patch("pyperclip.copy") as mock_copy,
+            mock.patch.object(io, "tool_output") as mock_tool_output,
+        ):
+            # Invoke the /copy command
+            commands.cmd_copy("")
+
+            # Assert pyperclip.copy was called with the last assistant message in cur_messages
+            mock_copy.assert_called_once_with("Latest assistant message in cur_messages")
+
+            # Assert that tool_output was called with the expected preview
+            expected_preview = (
+                "Copied last assistant message to clipboard. Preview: Latest assistant message in"
+                " cur_messages"
+            )
+            mock_tool_output.assert_any_call(expected_preview)
+        io = InputOutput(pretty=False, yes=True)
+        coder = Coder.create(self.GPT35, None, io)
+        commands = Commands(io, coder)
+
+        # Add only user messages
+        coder.done_messages = [
+            {"role": "user", "content": "User message"},
+        ]
+
+        # Mock io.tool_error
+        with mock.patch.object(io, "tool_error") as mock_tool_error:
+            commands.cmd_copy("")
+            # Assert tool_error was called indicating no assistant messages
+            mock_tool_error.assert_called_once_with("No assistant messages found to copy.")
+
+    def test_cmd_copy_pyperclip_exception(self):
+        io = InputOutput(pretty=False, yes=True)
+        coder = Coder.create(self.GPT35, None, io)
+        commands = Commands(io, coder)
+
+        coder.done_messages = [
+            {"role": "assistant", "content": "Assistant message"},
+        ]
+
+        # Mock pyperclip.copy to raise an exception
+        with (
+            mock.patch(
+                "pyperclip.copy", side_effect=pyperclip.PyperclipException("Clipboard error")
+            ),
+            mock.patch.object(io, "tool_error") as mock_tool_error,
+        ):
+            commands.cmd_copy("")
+
+            # Assert that tool_error was called with the clipboard error message
+            mock_tool_error.assert_called_once_with("Failed to copy to clipboard: Clipboard error")
+
     def test_cmd_add_bad_glob(self):
-        # https://github.com/paul-gauthier/aider/issues/293
+        # https://github.com/Aider-AI/aider/issues/293
 
         io = InputOutput(pretty=False, yes=False)
         from aider.coders import Coder
@@ -302,7 +401,7 @@ class TestCommands(TestCase):
                 pass
 
             # this was blowing up with GitCommandError, per:
-            # https://github.com/paul-gauthier/aider/issues/201
+            # https://github.com/Aider-AI/aider/issues/201
             commands.cmd_add("temp.txt")
 
     def test_cmd_commit(self):
@@ -343,7 +442,7 @@ class TestCommands(TestCase):
             outside_file.touch()
 
             # This should not be allowed!
-            # https://github.com/paul-gauthier/aider/issues/178
+            # https://github.com/Aider-AI/aider/issues/178
             commands.cmd_add("../outside.txt")
 
             self.assertEqual(len(coder.abs_fnames), 0)
@@ -367,7 +466,7 @@ class TestCommands(TestCase):
 
             # This should not be allowed!
             # It was blowing up with GitCommandError, per:
-            # https://github.com/paul-gauthier/aider/issues/178
+            # https://github.com/Aider-AI/aider/issues/178
             commands.cmd_add("../outside.txt")
 
             self.assertEqual(len(coder.abs_fnames), 0)
@@ -452,6 +551,29 @@ class TestCommands(TestCase):
 
             commands.cmd_add(str(dname))
 
+            dump(coder.abs_fnames)
+            self.assertIn(str(fname.resolve()), coder.abs_fnames)
+
+    def test_cmd_add_dirname_with_special_chars_git(self):
+        with GitTemporaryDirectory():
+            io = InputOutput(pretty=False, yes=False)
+            from aider.coders import Coder
+
+            coder = Coder.create(self.GPT35, None, io)
+            commands = Commands(io, coder)
+
+            dname = Path("with[brackets]")
+            dname.mkdir()
+            fname = dname / "filename.txt"
+            fname.touch()
+
+            repo = git.Repo()
+            repo.git.add(str(fname))
+            repo.git.commit("-m", "init")
+
+            commands.cmd_add(str(dname))
+
+            dump(coder.abs_fnames)
             self.assertIn(str(fname.resolve()), coder.abs_fnames)
 
     def test_cmd_add_abs_filename(self):
@@ -519,6 +641,86 @@ class TestCommands(TestCase):
             del coder
             del commands
             del repo
+
+    def test_cmd_read_only_with_glob_pattern(self):
+        with GitTemporaryDirectory() as repo_dir:
+            io = InputOutput(pretty=False, yes=False)
+            coder = Coder.create(self.GPT35, None, io)
+            commands = Commands(io, coder)
+
+            # Create multiple test files
+            test_files = ["test_file1.txt", "test_file2.txt", "other_file.txt"]
+            for file_name in test_files:
+                file_path = Path(repo_dir) / file_name
+                file_path.write_text(f"Content of {file_name}")
+
+            # Test the /read-only command with a glob pattern
+            commands.cmd_read_only("test_*.txt")
+
+            # Check if only the matching files were added to abs_read_only_fnames
+            self.assertEqual(len(coder.abs_read_only_fnames), 2)
+            for file_name in ["test_file1.txt", "test_file2.txt"]:
+                file_path = Path(repo_dir) / file_name
+                self.assertTrue(
+                    any(
+                        os.path.samefile(str(file_path), fname)
+                        for fname in coder.abs_read_only_fnames
+                    )
+                )
+
+            # Check that other_file.txt was not added
+            other_file_path = Path(repo_dir) / "other_file.txt"
+            self.assertFalse(
+                any(
+                    os.path.samefile(str(other_file_path), fname)
+                    for fname in coder.abs_read_only_fnames
+                )
+            )
+
+    def test_cmd_read_only_with_recursive_glob(self):
+        with GitTemporaryDirectory() as repo_dir:
+            io = InputOutput(pretty=False, yes=False)
+            coder = Coder.create(self.GPT35, None, io)
+            commands = Commands(io, coder)
+
+            # Create a directory structure with files
+            (Path(repo_dir) / "subdir").mkdir()
+            test_files = ["test_file1.txt", "subdir/test_file2.txt", "subdir/other_file.txt"]
+            for file_name in test_files:
+                file_path = Path(repo_dir) / file_name
+                file_path.write_text(f"Content of {file_name}")
+
+            # Test the /read-only command with a recursive glob pattern
+            commands.cmd_read_only("**/*.txt")
+
+            # Check if all .txt files were added to abs_read_only_fnames
+            self.assertEqual(len(coder.abs_read_only_fnames), 3)
+            for file_name in test_files:
+                file_path = Path(repo_dir) / file_name
+                self.assertTrue(
+                    any(
+                        os.path.samefile(str(file_path), fname)
+                        for fname in coder.abs_read_only_fnames
+                    )
+                )
+
+    def test_cmd_read_only_with_nonexistent_glob(self):
+        with GitTemporaryDirectory() as repo_dir:
+            io = InputOutput(pretty=False, yes=False)
+            coder = Coder.create(self.GPT35, None, io)
+            commands = Commands(io, coder)
+
+            # Test the /read-only command with a non-existent glob pattern
+            with mock.patch.object(io, "tool_error") as mock_tool_error:
+                commands.cmd_read_only(str(Path(repo_dir) / "nonexistent*.txt"))
+
+            # Check if the appropriate error message was displayed
+            mock_tool_error.assert_called_once_with(
+                f"No matches found for: {Path(repo_dir) / 'nonexistent*.txt'}"
+            )
+
+            # Ensure no files were added to abs_read_only_fnames
+            self.assertEqual(len(coder.abs_read_only_fnames), 0)
 
     def test_cmd_add_unicode_error(self):
         # Initialize the Commands and InputOutput objects
@@ -855,6 +1057,71 @@ class TestCommands(TestCase):
         finally:
             os.unlink(external_file_path)
 
+    def test_cmd_read_only_with_multiple_files(self):
+        with GitTemporaryDirectory() as repo_dir:
+            io = InputOutput(pretty=False, yes=False)
+            coder = Coder.create(self.GPT35, None, io)
+            commands = Commands(io, coder)
+
+            # Create multiple test files
+            test_files = ["test_file1.txt", "test_file2.txt", "test_file3.txt"]
+            for file_name in test_files:
+                file_path = Path(repo_dir) / file_name
+                file_path.write_text(f"Content of {file_name}")
+
+            # Test the /read-only command with multiple files
+            commands.cmd_read_only(" ".join(test_files))
+
+            # Check if all test files were added to abs_read_only_fnames
+            for file_name in test_files:
+                file_path = Path(repo_dir) / file_name
+                self.assertTrue(
+                    any(
+                        os.path.samefile(str(file_path), fname)
+                        for fname in coder.abs_read_only_fnames
+                    )
+                )
+
+            # Test dropping all read-only files
+            commands.cmd_drop(" ".join(test_files))
+
+            # Check if all files were removed from abs_read_only_fnames
+            self.assertEqual(len(coder.abs_read_only_fnames), 0)
+
+    def test_cmd_read_only_with_tilde_path(self):
+        with GitTemporaryDirectory():
+            io = InputOutput(pretty=False, yes=False)
+            coder = Coder.create(self.GPT35, None, io)
+            commands = Commands(io, coder)
+
+            # Create a test file in the user's home directory
+            home_dir = os.path.expanduser("~")
+            test_file = Path(home_dir) / "test_read_only_file.txt"
+            test_file.write_text("Test content")
+
+            try:
+                # Test the /read-only command with a path in the user's home directory
+                relative_path = os.path.join("~", "test_read_only_file.txt")
+                commands.cmd_read_only(relative_path)
+
+                # Check if the file was added to abs_read_only_fnames
+                self.assertTrue(
+                    any(
+                        os.path.samefile(str(test_file), fname)
+                        for fname in coder.abs_read_only_fnames
+                    )
+                )
+
+                # Test dropping the read-only file
+                commands.cmd_drop(relative_path)
+
+                # Check if the file was removed from abs_read_only_fnames
+                self.assertEqual(len(coder.abs_read_only_fnames), 0)
+
+            finally:
+                # Clean up: remove the test file from the home directory
+                test_file.unlink()
+
     def test_cmd_diff(self):
         with GitTemporaryDirectory() as repo_dir:
             repo = git.Repo(repo_dir)
@@ -975,3 +1242,38 @@ class TestCommands(TestCase):
             del coder
             del commands
             del repo
+
+    def test_cmd_reset(self):
+        with GitTemporaryDirectory() as repo_dir:
+            io = InputOutput(pretty=False, yes=True)
+            coder = Coder.create(self.GPT35, None, io)
+            commands = Commands(io, coder)
+
+            # Add some files to the chat
+            file1 = Path(repo_dir) / "file1.txt"
+            file2 = Path(repo_dir) / "file2.txt"
+            file1.write_text("Content of file 1")
+            file2.write_text("Content of file 2")
+            commands.cmd_add(f"{file1} {file2}")
+
+            # Add some messages to the chat history
+            coder.cur_messages = [{"role": "user", "content": "Test message 1"}]
+            coder.done_messages = [{"role": "assistant", "content": "Test message 2"}]
+
+            # Run the reset command
+            commands.cmd_reset("")
+
+            # Check that all files have been dropped
+            self.assertEqual(len(coder.abs_fnames), 0)
+            self.assertEqual(len(coder.abs_read_only_fnames), 0)
+
+            # Check that the chat history has been cleared
+            self.assertEqual(len(coder.cur_messages), 0)
+            self.assertEqual(len(coder.done_messages), 0)
+
+            # Verify that the files still exist in the repository
+            self.assertTrue(file1.exists())
+            self.assertTrue(file2.exists())
+
+            del coder
+            del commands

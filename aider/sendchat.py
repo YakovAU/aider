@@ -28,7 +28,7 @@ def retry_exceptions():
         litellm.exceptions.ServiceUnavailableError,
         litellm.exceptions.Timeout,
         litellm.exceptions.InternalServerError,
-        litellm.llms.anthropic.AnthropicError,
+        litellm.llms.anthropic.chat.AnthropicError,
     )
 
 
@@ -48,7 +48,12 @@ def lazy_litellm_retry_decorator(func):
 
 
 def send_completion(
-    model_name, messages, functions, stream, temperature=0, extra_headers=None, max_tokens=None
+    model_name,
+    messages,
+    functions,
+    stream,
+    temperature=0,
+    extra_params=None,
 ):
     from aider.llm import litellm
 
@@ -68,18 +73,18 @@ def send_completion(
     kwargs = dict(
         model=model_name,
         messages=messages,
-        temperature=temperature,
         stream=stream,
     )
+    if temperature is not None:
+        kwargs["temperature"] = temperature
 
     if functions is not None:
         function = functions[0]
         kwargs["tools"] = [dict(type="function", function=function)]
         kwargs["tool_choice"] = {"type": "function", "function": {"name": function["name"]}}
-    if extra_headers is not None:
-        kwargs["extra_headers"] = extra_headers
-    if max_tokens is not None:
-        kwargs["max_tokens"] = max_tokens
+
+    if extra_params is not None:
+        kwargs.update(extra_params)
 
     key = json.dumps(kwargs, sort_keys=True).encode()
 
@@ -98,14 +103,17 @@ def send_completion(
 
 
 @lazy_litellm_retry_decorator
-def simple_send_with_retries(model_name, messages):
+def simple_send_with_retries(model_name, messages, extra_params=None):
     try:
-        _hash, response = send_completion(
-            model_name=model_name,
-            messages=messages,
-            functions=None,
-            stream=False,
-        )
+        kwargs = {
+            "model_name": model_name,
+            "messages": messages,
+            "functions": None,
+            "stream": False,
+            "extra_params": extra_params,
+        }
+
+        _hash, response = send_completion(**kwargs)
         return response.choices[0].message.content
     except (AttributeError, litellm.exceptions.BadRequestError):
         return
