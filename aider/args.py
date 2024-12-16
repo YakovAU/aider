@@ -743,7 +743,6 @@ def get_md_help():
     parser.formatter_class = MarkdownHelpFormatter
 
     return argparse.ArgumentParser.format_help(parser)
-    return parser.format_help()
 
 
 def get_sample_yaml():
@@ -757,7 +756,6 @@ def get_sample_yaml():
     parser.formatter_class = YamlHelpFormatter
 
     return argparse.ArgumentParser.format_help(parser)
-    return parser.format_help()
 
 
 def get_sample_dotenv():
@@ -771,7 +769,6 @@ def get_sample_dotenv():
     parser.formatter_class = DotEnvFormatter
 
     return argparse.ArgumentParser.format_help(parser)
-    return parser.format_help()
 
 
 def main():
